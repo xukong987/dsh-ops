@@ -8,7 +8,7 @@ attention wasted on repeated PowerShell errors.
 
 > tips: "ops" here is short for the general sense of operations — the plugin sits at the base layer between dsh and system / code / file operations. It is not an operations (DevOps) plugin.
 
-**0.3.0 supports Windows x64 only**, targeting DSH `0.2.0-rc.2`. The independent Rust file/PTC worker is included; PTC remains opt-in. Linux/macOS/ARM64 are future work, not release claims. See [Native PTC](docs/native-ptc.md).
+**0.3.0 targets DSH `0.2.0-rc.2` on Windows x64 and Linux x64**: on Linux the same file tools and `ops_bash` come from the opt-in `dsh-ops/linux` component. The independent Rust file/PTC worker is included; PTC remains opt-in. macOS/ARM64 are future work, not release claims. See [Native PTC](docs/native-ptc.md).
 
 ---
 
@@ -42,7 +42,7 @@ Routing: **toolkit → bash → PowerShell 7**.
 ### Prerequisites
 
 - **Node.js `^22.19 || >=24`** (the `engines` requirement in `package.json`)
-- Windows x64
+- Windows x64 or Linux x64
 - The target DSH application initialized
 
 ### Install
@@ -82,7 +82,7 @@ Replace `desktop` with `web` or `tui` as appropriate.
 
 ## Components
 
-The bundle declares four independently toggled components. On first installation, the first two are enabled by default:
+The bundle declares five independently toggled components. On first installation, the first two are enabled by default; PTC and the Linux component are opt-in:
 
 | Component | Description | Default | Published tools |
 | --- | --- | --- | --- |
@@ -90,6 +90,21 @@ The bundle declares four independently toggled components. On first installation
 | `dsh-ops/file` | Faster, higher-performance Rust file retrieval with more concise, token-efficient output | On | Four file tools |
 | `dsh-ops/background` | Managed background tasks for scientific simulations, model training and other long-running processes | Off | Start, read output, list and terminate background jobs |
 | `dsh-ops/ptc` | Independent Rust safe batches and bounded result references, only in pure PTC sessions | Off | `ops_batch`, `ops_result` |
+| `dsh-ops/linux` | The same file tools and bash for Linux x64 hosts, resolved from the machine's own bash | Off | Four file tools, `ops_bash` |
+
+### The Linux component
+
+The Linux component is the same surface as the Windows shell and file components, resolved for a Linux host. It exists because the two Windows components assume Windows mechanisms that have no Linux counterpart:
+
+- **bash** comes from the machine (`PATH`, then `/bin/bash`, `/usr/bin/bash`, `/usr/local/bin/bash`), not from a pinned payload. Linux distributions ship a bash whose ABI matches their own libc; a second, separately-updated copy would add licensing and supply-chain burden without solving anything. The row therefore sets `allowSystemShellFallback: true`, and `bashPath` is available for an explicit executable. There is deliberately no Linux shell pin, and `dsh-ops provision-shells` remains Windows-only.
+- **Restricted modes** need the host confinement provider (`ctx.sandbox.confine`, which on Linux uses `bwrap` or Landlock). Without it the component never publishes `ops_bash` for that session; a missing sandbox can never degrade into an unconfined run. `LC_ALL=C.UTF-8` is set for confined commands because the host publishes its denial dialect in English.
+- **No workspace preparation and no PowerShell overlay**: the Windows ACL bootstrap and the bundled PowerShell 7 runtime have no Linux meaning. The host's own `pwsh` tool, when installed, is unaffected.
+- **PTC runs on both platforms; the background component remains Windows-only.** PTC's batch and result semantics are covered on Linux by the same suite that covers Windows (`test/ptc.test.mjs` runs against the Linux worker under the real sandbox).
+- **Where writes may land.** The file tools allow the workspace and one private directory per session (`<tmp>/dsh-ops-session-<id>`). That is deliberately narrower than the host sandbox: on Linux the host grants the whole of `/tmp` to workspace-write, so a confined command can still reach another session's temporary files, and the plugin's own fence refuses to. Full access adds no fence.
+
+The worker is the same Rust source, staged for Linux with `node bin/native-runtime.mjs stage --platform linux-x64 --input native/target/release` after `cargo build --release --locked --manifest-path native/Cargo.toml`.
+
+A release must stage **both** workers before packing: `runtime/` is already in the `files` whitelist, so staging is what puts a worker in the tarball, and `npm run verify:release` refuses a staging tree that carries only one of them.
 
 "Prefer bash as the terminal" means prompting the model to use `ops_bash` first; it **does not change the system default terminal, PATH or existing host shell tool names**.
 
@@ -105,7 +120,7 @@ Full tool parameters, configuration keys and permission requirements: [Component
 | --- | --- |
 | The complete install, update and remove flow with every option | [docs/usage.md](docs/usage.md) |
 | Every configuration key, and which component owns it | [docs/configuration-reference.md](docs/configuration-reference.md) |
-| What tools each of the four components publishes, with parameters and permissions | [docs/component-reference.md](docs/component-reference.md) |
+| What tools each of the five components publishes, with parameters and permissions | [docs/component-reference.md](docs/component-reference.md) |
 | How to read the errors, what to do when installation fails | [docs/troubleshooting.md](docs/troubleshooting.md) |
 | The native PTC design and usage | [docs/native-ptc.md](docs/native-ptc.md) |
 | Version history | [CHANGELOG.md](CHANGELOG.md) |

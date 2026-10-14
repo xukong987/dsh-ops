@@ -16,9 +16,17 @@ pub struct Store {
     pub dir: Dir,
     _lock: std::fs::File,
     read_only: bool,
+    /// The audit directory itself, for the entry-persisting directory fsync.
+    path: std::path::PathBuf,
 }
 impl Store {
-    pub fn open(root: &Dir, read_only: bool) -> Result<Self> {
+    /// Open the store, recording the directory whose entries the commit fsyncs.
+    ///
+    /// The path is not a trust input: callers pass the canonical root they
+    /// already resolved, and every read and write still goes through the
+    /// no-follow handle in this struct. Windows takes no directory fsync, so a
+    /// caller there may pass nothing.
+    pub fn open_at(root: &Dir, read_only: bool, path: Option<std::path::PathBuf>) -> Result<Self> {
         if !read_only {
             match root.create_dir(STORE) {
                 Ok(()) => (),
@@ -44,6 +52,7 @@ impl Store {
             dir,
             _lock: lock,
             read_only,
+            path: path.unwrap_or_default(),
         })
     }
     pub fn validate_id(id: &str) -> Result<()> {
@@ -144,16 +153,13 @@ impl Store {
         drop(f);
         self.dir
             .rename(&temporary, &self.dir, format!("{id}.{generation:06}.json"))?;
+        // Persist directory entries where the platform supports directory fsync.
+        // cap_std's Dir exposes no sync method, and a descriptor cloned from it
+        // is not fsyncable on Linux, so the directory is opened by path instead.
+        // PR #40's implementation wins over PR #30's try_clone/EBADF tolerance:
+        // opening the directory by path is what actually syncs on Linux.
         #[cfg(unix)]
-        {
-            let synced = self.dir.try_clone()?.into_std_file().sync_all();
-            if let Err(error) = synced {
-                const EBADF: i32 = 9;
-                if error.raw_os_error() != Some(EBADF) {
-                    return Err(error.into());
-                }
-            }
-        }
+        crate::paths::sync_directory(&self.path)?;
         Ok(())
     }
     pub fn release(&self, id: &str) -> Result<()> {

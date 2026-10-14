@@ -7,7 +7,7 @@ Windows DSH 的性能工具插件：提供独立 bash / PowerShell 7，并用 Ru
 
 > tips：本项目的 ops 是广义 operations（运行操作）的缩写，代指本插件处于 dsh 和系统/代码/文件操作的基础工具位置。本项目不是 operations（运维）插件。
 
-**0.3.0 仅支持 Windows x64**，目标宿主 DSH `0.2.0-rc.2`。原生 Rust 文件/PTC worker 随包携带；PTC 默认关闭，须显式启用。Linux/macOS/ARM64 留待后续版本。见 [PTC 设计与使用](docs/native-ptc.md)。
+**0.3.0 面向 Windows x64 与 Linux x64**，目标宿主 DSH `0.2.0-rc.2`：Linux 由可选组件 `dsh-ops/linux` 提供同一套文件工具与 `ops_bash`。原生 Rust 文件/PTC worker 随包携带；PTC 默认关闭，须显式启用。macOS/ARM64 留待后续版本。见 [PTC 设计与使用](docs/native-ptc.md)。
 
 有问题可以加qq群：1127808570
 
@@ -82,7 +82,7 @@ npx --yes dsh-ops@latest uninstall --profile desktop
 
 ## 组件
 
-Bundle 声明四个组件，分别启停，首次安装默认开启前两个：
+Bundle 声明五个组件，分别启停，首次安装默认开启前两个；PTC 与 Linux 组件须显式启用：
 
 | 组件 | 介绍 | 默认 | 发布的工具 |
 | --- | --- | --- | --- |
@@ -90,6 +90,26 @@ Bundle 声明四个组件，分别启停，首次安装默认开启前两个：
 | `dsh-ops/file` | 更快、更高性能、输出更精简更省 token 的 Rust 文件检索 | 开 | 四个文件工具 |
 | `dsh-ops/background` | 为科研仿真、模型训练及其他长进程后台任务提供托管 | 关 | 启动、输出、列出、终止后台任务 |
 | `dsh-ops/ptc` | 独立 Rust 安全批处理和有界结果引用，仅纯 PTC 会话加载 | 关 | `ops_batch`、`ops_result` |
+| `dsh-ops/linux` | Linux x64 宿主上的同一套文件工具与 bash，bash 用机器自带的那一份 | 关 | 四个文件工具、`ops_bash` |
+
+### Linux 组件
+
+Linux 组件提供的是和 Windows 的 shell、file 两个组件**同名同语义**的工具面，只是按 Linux 宿主解析。它存在的原因是那两个 Windows 组件依赖的机制在 Linux 上没有对应物：
+
+- **bash 用机器自带的那一份**（先查 `PATH`，再查 `/bin/bash`、`/usr/bin/bash`、`/usr/local/bin/bash`），不 pin 独立副本。发行版自带的 bash 与它自己的 libc、架构配套；再放一份要单独更新的副本，只会增加许可与供应链负担，解决不了任何问题。该行因此设置 `allowSystemShellFallback: true`，也可以用 `bashPath` 指定明确的可执行文件。本仓库**刻意没有 Linux shell pin**，`dsh-ops provision-shells` 仍是 Windows 专用。
+- **受限模式必须有宿主沙箱**（`ctx.sandbox.confine`，Linux 上走 `bwrap` 或 Landlock）。没有它，组件不会给该会话发布 `ops_bash`——缺沙箱绝不会退化成“无限制执行”。受限命令会带上 `LC_ALL=C.UTF-8`，因为宿主沙箱的拒绝特征串是英文的。
+- **不做工作区准备、不叠加 PowerShell**：Windows 的 ACL 前置和自带 PowerShell 7 在 Linux 上没有意义。宿主自己的 `pwsh` 工具（若装了）不受影响。
+- **PTC 在两个平台都能跑；background 组件仍仅 Windows。** PTC 的批处理与结果引用语义在 Linux 上由与 Windows 同一套测试覆盖（`test/ptc.test.mjs` 在真实沙箱下驱动 Linux worker）。
+- **写入能落在哪里**：文件工具只允许工作区 + 每个会话一个私有目录（`<临时目录>/dsh-ops-session-<会话标识>`）。这比宿主沙箱**更窄**：Linux 上宿主把整个 `/tmp` 都授予 workspace-write，所以受限命令仍能碰到别的会话的临时文件，而插件自己的围栏不允许。完全权限不加围栏。
+
+发布前必须**两个 worker 都 stage**：`runtime/` 已在 `files` 白名单里，stage 进去才会进 tarball；`npm run verify:release` 会拒绝只带一个平台的暂存树。
+
+worker 是同一份 Rust 源码，构建并 stage 到主包：
+
+```console
+cargo build --release --locked --manifest-path native/Cargo.toml
+node bin/native-runtime.mjs stage --platform linux-x64 --input native/target/release
+```
 
 “默认终端改为 bash”指模型提示优先使用 `ops_bash`，**不修改系统默认终端、PATH 或宿主原有 shell 工具名称**。
 
@@ -105,7 +125,7 @@ Bundle 声明四个组件，分别启停，首次安装默认开启前两个：
 | --- | --- |
 | 安装、更新、卸载的完整流程与全部选项 | [docs/使用指南.md](docs/使用指南.md) |
 | 配置项逐个说明、哪个键属于哪个组件 | [docs/配置参考.md](docs/配置参考.md) |
-| 四个组件分别发布什么工具、参数与权限 | [docs/组件参考.md](docs/组件参考.md) |
+| 五个组件分别发布什么工具、参数与权限 | [docs/组件参考.md](docs/组件参考.md) |
 | 报错怎么读、装不上怎么办、常见问题 | [docs/常见问题.md](docs/常见问题.md) |
 | 原生 PTC 的设计与使用 | [docs/native-ptc.md](docs/native-ptc.md) |
 | 版本变更历史 | [CHANGELOG.md](CHANGELOG.md) |

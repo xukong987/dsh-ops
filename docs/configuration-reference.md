@@ -6,9 +6,9 @@ Every configuration key, and **which component row owns it**.
 
 ## Where configuration lives
 
-In DSH's configuration editor, find the corresponding `dsh-ops/shell`, `dsh-ops/file`, `dsh-ops/background` or `dsh-ops/ptc` row, adjust `config`, then save; unknown configuration keys cause errors naming the key.
+In DSH's configuration editor, find the corresponding `dsh-ops/shell`, `dsh-ops/file`, `dsh-ops/background`, `dsh-ops/ptc` or `dsh-ops/linux` row, adjust `config`, then save; unknown configuration keys cause errors naming the key.
 
-The bundle declares four independently toggled components. On first installation, the first two are enabled by default:
+The bundle declares five independently toggled components. On first installation, the first two are enabled by default; PTC and the Linux component are opt-in:
 
 | Row `name` | Component | Default |
 | --- | --- | --- |
@@ -16,6 +16,7 @@ The bundle declares four independently toggled components. On first installation
 | `dsh-ops/file` | Rust file tools | On |
 | `dsh-ops/background` | Background tasks | Off |
 | `dsh-ops/ptc` | Native PTC batches | Off |
+| `dsh-ops/linux` | Linux host surface: the file tools and the machine's own bash | Off |
 
 ---
 
@@ -28,16 +29,17 @@ The table below gives the **owning component** for each key. Putting a key on a 
 | `configUpdateVersion` | non-negative integer | `0` | any (migration marker) |
 | `serverName` | string, `[A-Za-z0-9_-]{1,32}` | `fastctx` | legacy compatibility |
 | `binaryPath` | string path | — | background / ptc |
-| `bashPath` | string path | — | shell |
+| `bashPath` | string path | — | shell / linux |
 | `enableShellTools` | boolean | `true` | background |
-| `publishBashTool` | boolean | `true` | shell |
+| `publishBashTool` | boolean | `true` | shell / linux |
 | `promptPolicy` | boolean | `true` | all |
 | `extraGuidance` | string | empty | all |
 | `toolCallTimeoutMs` | positive integer (ms) | `300000` | background / file |
 | `required` | boolean | `false` | all |
 | `shellPolicy` | `advise` \| `deny-host-shell` | `advise` | shell |
 | `deniedHostTools` | string array | `[pwsh, bash, pwsh_persistent]` | shell |
-| `allowSystemShellFallback` | boolean | `false` | shell |
+| `allowSystemShellFallback` | boolean | `false` | shell / linux |
+| `denyCredentialReads` | boolean | `true` | file / linux / ptc |
 
 ---
 
@@ -78,6 +80,7 @@ config:
 - `required`: whether to reject activation when the runtime is unavailable.
 - `shellPolicy`: defaults to `advise`; `deny-host-shell` rejects host shells in `deniedHostTools` (default `[pwsh, bash, pwsh_persistent]`). This also disables third-layer pwsh; enable cautiously.
 - `allowSystemShellFallback`: defaults to `false`. Without a bundled/provisioned bash, do not discover system PATH or well-known installations; background commands cannot bypass this through FastCtx discovery either. Explicit `true` opts into an unpinned system bash that the operator must trust and maintain. Explicit `bashPath` is a separate operator selection, not an automatic fallback. See the update configuration modification area in the [usage guide](usage.md) for the first-start migration.
+- `denyCredentialReads`: defaults to `true`. The file tools refuse paths inside a credential location (`~/.ssh`, `~/.aws`, `~/.kube`, `~/.dsh/.credentials.yaml`, `.npmrc`, `.netrc`, `.git-credentials`, private-key names, credential-shaped files, `.env`), in every permission mode and for a batch operation root as well. Writes were already fenced by the permission mode; this closes the read direction, because the DSH filesystem layer does not fence those paths and a repository tool has no job that needs one. Set `false` per row to allow a specific deployment's file, or add paths with `DSH_OPS_DENY_READ` (which only widens the list, never opens it).
 - `shellPolicy` is independent: `deny-host-shell` masks/refuses host tools; disabling fallback constrains the plugin's bash resolver, not the host's own `pwsh`, and is not a filesystem sandbox.
 - `binaryPath` / `bashPath`: optional explicit paths; unavailable paths cause an error rather than silently switching executors. Usually no configuration is needed.
 - `deniedHostTools`: the host tool names refused by the `deny-host-shell` policy.
