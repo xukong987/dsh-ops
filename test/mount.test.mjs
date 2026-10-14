@@ -31,12 +31,17 @@ async function fileMount(ctx, config = {}) {
   if (!ctx.get('sandboxPolicy')) await ctx.plugin(inner => inner.provide('sandboxPolicy', {
     resolve: ({ session }) => ({ mode: session.mode, workspaceRoot: session.header.cwd, sessionId: session.id }),
   }))
-  return mountPlugin({ ctx, config: { toolCallTimeoutMs: 5000, ...config }, expectTools: EXPECTED.length })
+  // The file tools are published per session (#52), so the mount itself
+  // publishes nothing global to wait for: a caller announces its session next.
+  return mountPlugin({ ctx, config: { toolCallTimeoutMs: 5000, ...config }, expectTools: 0 })
 }
 async function agentForCall(ctx, cwd, mode = 'danger-full-access') {
   const result = { id: 'file-call', session: { id: 'file-call', mode, header: { cwd } } }
   const { createScope } = await import('@deepseek-ai/dsh-scope')
   result.ctx = createScope(ctx, result).ctx
+  // The calling session has to be announced before any file tool resolves.
+  await ctx.serial('agent/created', { agent: result, source: 'startup' })
+  await waitFor(() => EXPECTED.every(name => scopedToolNames(ctx, result).includes(name)), { timeoutMs: 5000, what: 'the per-session file tools' })
   return result
 }
 async function component(ctx, name, config = {}) {
@@ -62,13 +67,19 @@ async function sections(ctx, currentAgent) { return renderSections(ctx, currentA
 async function visible(ctx, currentAgent, expected) {
   await waitFor(() => expected.every(name => scopedToolNames(ctx, currentAgent).includes(name)), { timeoutMs: 5000, what: expected.join(', ') })
 }
-await test('file mount owns exactly four tools and never overrides the registry', async () => {
+await test('file mount serves exactly four tools per session and never overrides the registry', async () => {
   const { ctx } = await bootHost()
   try {
-    const { tools } = await fileMount(ctx)
-    assert.deepEqual(tools, EXPECTED)
+    await fileMount(ctx)
+    // #52: a session context is a SIBLING of the plugin row's, so a global
+    // registration here would be registered successfully and visible to no
+    // agent. Nothing may reach the shared registry.
+    assert.deepEqual(registryNames(ctx), [])
     assert.equal(registryHasOwnRegister(ctx), false)
-    assert.deepEqual(registryNames(ctx), EXPECTED)
+    const owner = await agent(ctx, 'file-owner')
+    await visible(ctx, owner, EXPECTED)
+    assert.deepEqual(scopedToolNames(ctx, owner).filter(name => EXPECTED.includes(name)), EXPECTED)
+    assert.deepEqual(registryNames(ctx), [], 'a per-session registration must not leak into the shared registry')
     assert.equal(registryNames(ctx).some(name => name.includes('__')), false)
   } finally { await shutdown(ctx) }
 })
@@ -96,7 +107,7 @@ await test('the same foreign name registers in two real scopes without becoming 
     for (const scope of [first.scopeKey, second.scopeKey]) assert.ok(scopedToolNames(ctx, scope).includes('subagent'))
     assert.equal(registryNames(ctx).includes('subagent'), false)
     await first.dispose(); await second.dispose()
-    assert.deepEqual(registryNames(ctx), EXPECTED)
+    assert.deepEqual(registryNames(ctx), [])
   } finally { await shutdown(ctx) }
 })
 await test('real FastCtx calls return data and propagate server errors promptly', async () => {
@@ -143,12 +154,15 @@ await test('the file component renders its live tools and retires both legacy se
   const { ctx } = await bootHost()
   try {
     const { fiber } = await fileMount(ctx)
-    const rendered = await sections(ctx)
+    const owner = await agent(ctx, 'file-sections')
+    await visible(ctx, owner, EXPECTED)
+    const rendered = await sections(ctx, owner)
     for (const name of EXPECTED) assert.ok(rendered.get(FILE_SECTION).includes(name))
     for (const name of ['dsh-ops:host-shell-policy', 'mcp:fastctx', SHELL_SECTION, BG_SECTION]) assert.equal(rendered.has(name), false)
     await fiber.dispose()
     assert.deepEqual(publicToolNames(ctx), [])
-    assert.equal((await sections(ctx)).has(FILE_SECTION), false)
+    assert.equal(EXPECTED.some(name => scopedToolNames(ctx, owner).includes(name)), false, 'disposal releases the session tools')
+    assert.equal((await sections(ctx, owner)).has(FILE_SECTION), false)
   } finally { await shutdown(ctx) }
 })
 await test('optional missing runtime degrades honestly, required runtime rejects activation', async () => {
@@ -157,7 +171,11 @@ await test('optional missing runtime degrades honestly, required runtime rejects
     const binaryPath = path.join(process.cwd(), 'no-such-fastctx.exe')
     const { fiber } = await mountPlugin({ ctx, config: { binaryPath }, expectTools: 0 })
     assert.deepEqual(publicToolNames(ctx), [])
-    assert.equal((await sections(ctx)).get(FILE_SECTION) ?? '', '')
+    // The honest check is per session: no worker means no session is served.
+    const owner = await agent(ctx, 'no-runtime')
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(EXPECTED.some(name => scopedToolNames(ctx, owner).includes(name)), false)
+    assert.equal((await sections(ctx, owner)).get(FILE_SECTION) ?? '', '')
     await fiber.dispose()
     await assert.rejects(() => mountPlugin({ ctx, config: { binaryPath, required: true }, expectTools: 0 }), /binaryPath/)
   } finally { await shutdown(ctx) }
@@ -166,8 +184,10 @@ await test('promptPolicy false leaves tools live with no prompt section', async 
   const { ctx } = await bootHost()
   try {
     await fileMount(ctx, { promptPolicy: false })
-    assert.deepEqual(publicToolNames(ctx), EXPECTED)
-    assert.equal((await sections(ctx)).has(FILE_SECTION), false)
+    const owner = await agent(ctx, 'file-no-prompt')
+    await visible(ctx, owner, EXPECTED)
+    assert.deepEqual(scopedToolNames(ctx, owner).filter(name => EXPECTED.includes(name)), EXPECTED)
+    assert.equal((await sections(ctx, owner)).has(FILE_SECTION), false)
   } finally { await shutdown(ctx) }
 })
 await test('bash is scoped to authorized sessions, responds to mode changes, and unloads cleanly', async () => {
@@ -248,14 +268,18 @@ await test('file/background share runtime, but command tools never leak into glo
     const background = await component(ctx, 'background', { bashPath: process.execPath })
     const full = await agent(ctx, 'background-full')
     const jobs = BACKGROUND_TOOLS.map(publicToolName)
+    // Check the file surface first so a missing FastCtx runtime reports as its
+    // own failure instead of masking the per-session file tools.
+    await visible(ctx, full, EXPECTED)
     await visible(ctx, full, jobs)
     const child = await agent(ctx, 'background-restricted', 'read-only', full)
     await waitFor(() => jobs.every(name => !scopedToolNames(ctx, child).includes(name)), { timeoutMs: 5000 })
-    assert.deepEqual(registryNames(ctx), EXPECTED)
+    assert.deepEqual(registryNames(ctx), [], 'neither surface may reach the shared registry')
     assert.equal(scopedToolNames(ctx, full).includes('ops_run'), false)
     assert.match((await sections(ctx, full)).get(BG_SECTION), /Only operate on job IDs you started/)
     await file.fiber.dispose()
     await visible(ctx, full, jobs)
+    assert.equal(EXPECTED.some(name => scopedToolNames(ctx, full).includes(name)), false, 'disposing the file component releases that session layer')
     assert.deepEqual(registryNames(ctx), [])
     await background.dispose()
     assert.equal(jobs.some(name => scopedToolNames(ctx, full).includes(name)), false)
@@ -296,7 +320,7 @@ await test('missing approved bash blocks background publication and isolates sha
       const full = await agent(ctx, 'no-approved-executor')
       await new Promise(resolve => setImmediate(resolve))
       for (const name of BACKGROUND_TOOLS.map(publicToolName)) assert.equal(scopedToolNames(ctx, full).includes(name), false)
-      assert.deepEqual(registryNames(ctx), EXPECTED)
+      assert.deepEqual(registryNames(ctx), [], 'the file component registers per session, so nothing is global')
       assert.equal(((await sections(ctx, full)).get(BG_SECTION) ?? ''), '')
     } finally {
       if (previous === undefined) delete process.env.FASTCTX_BASH

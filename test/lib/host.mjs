@@ -256,14 +256,18 @@ export async function renderSections(ctx, agent) {
 /**
  * Call one registered tool the way the loop does: run the definition's body,
  * then render its canonical value into model-facing content.
+ *
+ * The lookup is scoped to `agent` — a definition a plugin published into an
+ * agent's own context is resolvable only from that scope.
  * @param {Context} ctx - the host context.
  * @param {string} name - the tool name.
  * @param {Record<string, unknown>} args - the arguments.
  * @param {AbortSignal} [signal] - the caller's signal.
+ * @param {object} [agent] - the calling agent, which selects the registration scope.
  * @returns {Promise<{value: unknown, text: string, content: {type: string, text?: string}[]}>} the outcome.
  */
 export async function callTool(ctx, name, args, signal = new AbortController().signal, agent) {
-  const definition = ctx.get('tools').get(name)
+  const definition = ctx.get('tools').get(name, agent)
   if (definition === undefined) throw new Error(`tool "${name}" is not registered`)
   const value = await definition.execute(args, { callId: 'test', name, arguments: args, signal, agent: agent ?? { session: { id: 'file-call', header: { cwd: process.cwd() } } } })
   const content = definition.output.render(args, value)

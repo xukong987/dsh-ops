@@ -22,14 +22,15 @@ import { createScope } from '@deepseek-ai/dsh-scope'
 import Sandbox from '@deepseek-ai/dsh-sandbox-local'
 import Subprocess from '@deepseek-ai/dsh-subprocess-local'
 import { applyComponent } from '../lib/index.js'
-import { BASH_TOOL, publicToolName } from '../lib/policy.js'
+import { FILE_TOOLS, BASH_TOOL, publicToolName } from '../lib/policy.js'
 import { invoke as ptcInvoke } from '../lib/ptc/worker.js'
 import { resolveWorker } from '../lib/ptc/runtime.js'
 import { sessionTempDir } from '../lib/session-temp.js'
 import { assert, report, test, waitFor, withTempDir } from './lib/harness.mjs'
-import { bootHost, shutdown } from './lib/host.mjs'
+import { bootHost, scopedToolNames, shutdown } from './lib/host.mjs'
 
 const MODES = ['read-only', 'workspace-write', 'danger-full-access']
+const FILE_TOOLS_PUBLIC = FILE_TOOLS.map(publicToolName)
 
 async function mount(ctx) {
   await ctx.plugin(Subprocess)
@@ -40,14 +41,16 @@ async function mount(ctx) {
   await ctx.plugin({ name: 'sandbox-matrix', apply(inner) {
     return applyComponent(inner, { promptPolicy: false, publishBashTool: true, allowSystemShellFallback: true, configUpdateVersion: 1 }, 'linux')
   } })
-  await waitFor(() => ['glob', 'grep', 'inspect_local_file', 'replace'].map(publicToolName).every(n => (ctx.get('tools').schemas() ?? []).some(s => s.name === n)), 10_000)
 }
 
 async function session(ctx, root, mode) {
   const agent = { id: `sandbox-${mode}`, session: { id: `sandbox-${mode}`, mode, header: { cwd: root } } }
   agent.ctx = createScope(ctx, agent).ctx
   await ctx.serial('agent/created', { agent })
-  await waitFor(() => ctx.get('tools').get(BASH_TOOL, agent) !== undefined, 10_000)
+  // Both surfaces publish per session (#52), so the session has to exist before
+  // either tool resolves.
+  await waitFor(() => FILE_TOOLS_PUBLIC.every(name => scopedToolNames(ctx, agent).includes(name)), { timeoutMs: 10_000, what: 'the per-session file tools' })
+  await waitFor(() => scopedToolNames(ctx, agent).includes(BASH_TOOL), { timeoutMs: 10_000, what: 'the per-session bash' })
   return agent
 }
 

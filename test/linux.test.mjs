@@ -18,12 +18,17 @@ import { resolveWorker } from '../lib/ptc/runtime.js'
 import { sessionTempDir } from '../lib/session-temp.js'
 import { BASH_TOOL, FILE_TOOLS, TOOLING_SECTION, publicToolName } from '../lib/policy.js'
 import { assert, report, test, waitFor, withTempDir } from './lib/harness.mjs'
-import { bootHost, publicToolNames, renderSections, shutdown } from './lib/host.mjs'
+import { bootHost, registryNames, renderSections, scopedToolNames, shutdown } from './lib/host.mjs'
 
 const FILE_EXPECTED = FILE_TOOLS.map(publicToolName).sort()
 const EXPECTED = [...FILE_EXPECTED, BASH_TOOL].sort()
 
-/** Mount the Linux component with the real policy, sandbox and subprocess services. */
+/**
+ * Mount the Linux component with the real policy, sandbox and subprocess services.
+ *
+ * Nothing is published by the mount itself: both surfaces register per session,
+ * so a caller creates its session next (see {@link sessionFor}).
+ */
 async function mountLinux(ctx, cwd, config = {}) {
   await ctx.plugin(Subprocess)
   await ctx.plugin(Sandbox, {})
@@ -33,24 +38,20 @@ async function mountLinux(ctx, cwd, config = {}) {
   // `configUpdateVersion` is what keeps the 0.2.5 fallback retirement from
   // rewriting this row's explicit system-bash opt-in; the shipped patch row
   // carries the same marker.
-  const fiber = await ctx.plugin({ name: 'fixture-linux', apply(inner) {
+  return ctx.plugin({ name: 'fixture-linux', apply(inner) {
     return applyComponent(inner, { promptPolicy: true, publishBashTool: true, allowSystemShellFallback: true, configUpdateVersion: 1, ...config }, 'linux')
   } })
-  const deadline = Date.now() + 10_000
-  for (;;) {
-    // The bash surface appears per agent, so the mount itself waits only for
-    // the globally registered file tools.
-    const names = publicToolNames(ctx)
-    if (names.length >= FILE_EXPECTED.length) return { fiber, names }
-    if (Date.now() > deadline) throw new Error(`linux component mount timed out: got ${names.join(', ')}`)
-    await new Promise(resolve => setTimeout(resolve, 50))
-  }
 }
 
-/** One agent scope with its own session mode and cwd. */
-async function agentFor(ctx, cwd, mode) {
+/** One agent scope with its own session mode and cwd, announced and then served. */
+async function sessionFor(ctx, cwd, mode) {
   const agent = { id: `linux-${mode}`, session: { id: `linux-${mode}`, mode, header: { cwd } } }
   agent.ctx = createScope(ctx, agent).ctx
+  await ctx.serial('agent/created', { agent, source: 'startup' })
+  // Both surfaces are registered per agent, exactly as the Windows components
+  // register them: the agent has to exist before either tool does.
+  await waitFor(() => FILE_EXPECTED.every(name => scopedToolNames(ctx, agent).includes(name)), { timeoutMs: 10_000, what: 'the per-session file tools' })
+  await waitFor(() => scopedToolNames(ctx, agent).includes(BASH_TOOL), { timeoutMs: 10_000, what: 'the per-session bash' })
   return agent
 }
 
@@ -68,14 +69,12 @@ await test('the Linux component publishes the same tool names as the Windows com
     const { ctx } = await bootHost()
     try {
       await ctx.plugin(inner => inner.provide('host-edit', {}))
-      const { names } = await mountLinux(ctx, root)
-      assert.deepEqual(names.filter(name => EXPECTED.includes(name)).sort(), FILE_EXPECTED)
-      // Bash is registered per agent, exactly as the Windows shell component
-      // registers it: the same names, on the same authority check.
-      const agent = await agentFor(ctx, root, 'workspace-write')
-      await ctx.serial('agent/created', { agent })
-      await waitFor(() => ctx.get('tools').get(BASH_TOOL, agent) !== undefined, 10_000)
-      assert.ok(ctx.get('tools').get(publicToolName('replace'), agent), 'the file tools are visible to the agent scope too')
+      await mountLinux(ctx, root)
+      // Neither surface is global: a session context is a sibling of the plugin
+      // row's, so a registration there would be visible to no agent (#52).
+      assert.deepEqual(registryNames(ctx), [], 'the mounted component publishes nothing globally')
+      const agent = await sessionFor(ctx, root, 'workspace-write')
+      assert.ok(ctx.get('tools').get(publicToolName('replace'), agent), 'the file tools are visible to the agent scope')
       const sections = await renderSections(ctx, agent)
       const text = sections.get(`${TOOLING_SECTION}:linux`)
       assert.ok(text, 'the Linux component contributes its own tooling section')
@@ -94,11 +93,7 @@ await test('the Linux component follows the DSH permission modes', async () => {
     try {
       await mountLinux(ctx, root)
       fs.writeFileSync(path.join(root, 'data.txt'), 'before')
-      const agent = await agentFor(ctx, root, 'workspace-write')
-      // The bash surface is registered per agent, exactly as the Windows shell
-      // component registers it: the agent has to exist before the tool does.
-      await ctx.serial('agent/created', { agent })
-      await waitFor(() => ctx.get('tools').get(BASH_TOOL, agent) !== undefined, 10_000)
+      const agent = await sessionFor(ctx, root, 'workspace-write')
       const replace = ctx.get('tools').get(publicToolName('replace'), agent)
       const bash = ctx.get('tools').get(BASH_TOOL, agent)
       assert.ok(replace && bash, 'both surfaces publish under the agent scope')
@@ -145,7 +140,7 @@ await test('the file tools refuse credential locations in every mode', async () 
       await mountLinux(ctx, root)
       fs.writeFileSync(path.join(root, 'plain.txt'), 'ok\n')
       for (const mode of ['read-only', 'workspace-write', 'danger-full-access']) {
-        const agent = await agentFor(ctx, root, mode)
+        const agent = await sessionFor(ctx, root, mode)
         const inspect = ctx.get('tools').get(publicToolName('inspect_local_file'), agent)
         const refused = await inspect.execute({ path: credential }, { agent, signal: new AbortController().signal })
         assert.equal(refused.status, 'rejected', `${mode}: ${JSON.stringify(refused)}`)
@@ -165,7 +160,7 @@ await test('writes are scoped to the workspace and the session\'s own temp direc
     try {
       await mountLinux(ctx, root)
       fs.writeFileSync(path.join(root, 'data.txt'), 'before')
-      const agent = await agentFor(ctx, root, 'workspace-write')
+      const agent = await sessionFor(ctx, root, 'workspace-write')
       const replace = ctx.get('tools').get(publicToolName('replace'), agent)
       const exec = { agent, signal: new AbortController().signal }
 
@@ -205,7 +200,7 @@ await test('traversals never name a credential location', async () => {
     const { ctx } = await bootHost()
     try {
       await mountLinux(ctx, root)
-      const agent = await agentFor(ctx, root, 'workspace-write')
+      const agent = await sessionFor(ctx, root, 'workspace-write')
       const call = (name, args) => ctx.get('tools').get(publicToolName(name), agent).execute(args, { agent, signal: new AbortController().signal })
       const walked = await call('glob', { path: os.homedir(), pattern: ['**/*'], limit: 500 })
       assert.equal(walked.status, 'completed', JSON.stringify(walked))

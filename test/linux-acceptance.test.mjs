@@ -16,10 +16,14 @@ import Subprocess from '@deepseek-ai/dsh-subprocess-local'
 import { applyComponent } from '../lib/index.js'
 import { BASH_TOOL, publicToolName } from '../lib/policy.js'
 import { assert, report, test, waitFor, withTempDir } from './lib/harness.mjs'
-import { bootHost, publicToolNames, shutdown } from './lib/host.mjs'
+import { bootHost, registryNames, scopedToolNames, shutdown } from './lib/host.mjs'
 
 const FILE_TOOLS = ['glob', 'grep', 'inspect_local_file', 'replace'].map(publicToolName)
 
+/**
+ * Mount the Linux component. Nothing is published by the mount itself: the file
+ * tools and bash both register per session (see {@link sessionFor}).
+ */
 async function mountLinux(ctx) {
   await ctx.plugin(Subprocess)
   await ctx.plugin(Sandbox, {})
@@ -29,14 +33,15 @@ async function mountLinux(ctx) {
   await ctx.plugin({ name: 'fixture-linux-acceptance', apply(inner) {
     return applyComponent(inner, { promptPolicy: false, publishBashTool: true, allowSystemShellFallback: true, configUpdateVersion: 1 }, 'linux')
   } })
-  await waitFor(() => FILE_TOOLS.every(name => publicToolNames(ctx).includes(name)), 10_000)
+  assert.deepEqual(registryNames(ctx), [], 'the component registers nothing globally')
 }
 
 async function sessionFor(ctx, root, mode) {
   const agent = { id: `accept-${mode}`, session: { id: `accept-${mode}`, mode, header: { cwd: root } } }
   agent.ctx = createScope(ctx, agent).ctx
   await ctx.serial('agent/created', { agent })
-  await waitFor(() => ctx.get('tools').get(BASH_TOOL, agent) !== undefined, 10_000)
+  await waitFor(() => FILE_TOOLS.every(name => scopedToolNames(ctx, agent).includes(name)), { timeoutMs: 10_000, what: 'the per-session file tools' })
+  await waitFor(() => scopedToolNames(ctx, agent).includes(BASH_TOOL), { timeoutMs: 10_000, what: 'the per-session bash' })
   return agent
 }
 
